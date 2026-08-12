@@ -1,0 +1,34 @@
+[baan]
+# Delay before injecting replacement output (ms)
+flush_delay_ms = 100
+# Delay before reading the clipboard after Ctrl+C (ms)
+clipboard_read_delay_ms = 120
+# Delay before pasting after writing to the clipboard, and before restoring
+# the previous clipboard value (ms). Prevents pasting stale clipboard content.
+clipboard_write_delay_ms = 80
+
+[triggers]
+hi = ["echo", "-n", "Hello World!"]
+hello = ["echo", "Hello {}!"]
+now = ["date", "+%Y%m%d%H%M%S"]
+date = ["date"]
+base64 = ["sh", "-c", "echo {} | base64"]
+rev = ["sh", "-c", "echo {} | rev"]
+time = ["curl", "https://timeapi.io/api/Time/current/zone?timeZone=UTC"]
+fix = [
+  "sh",
+  "-c",
+  """curl http://localhost:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-e2b-it",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Please correct the grammar, punctuation, and structure of my text only. Do not explain anything: {}"
+      }
+    ],
+    "temperature": 0.3,
+    "max_tokens": 500
+  }' | jq -r '.choices[0].message.content'"""
+]

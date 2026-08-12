@@ -1,0 +1,17 @@
+# Compiled artifacts
+/target/
+
+# Lock file for app (commit is optional for binaries, but ignoring is safe)
+Cargo.lock
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.mimocode
+baan.toml
+.agents/

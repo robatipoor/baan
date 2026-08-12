@@ -1,0 +1,22 @@
+[Unit]
+Description=Baan keyboard expansion daemon (keyboard %i)
+After=multi-user.target
+Wants=display-manager.service
+
+[Service]
+Type=simple
+# Instance name is the event node under /dev/input/, e.g. event3 → /dev/input/event3
+Environment=BAAN_CONFIG_FILE_PATH=/etc/baan/baan.toml
+ExecStartPre=/bin/sh -c 'until ls /run/user/*/wayland-* >/dev/null 2>&1 || ls /tmp/.X11-unix/X* >/dev/null 2>&1; do sleep 1; done'
+ExecStart=/usr/local/bin/baan -k /dev/input/%i
+Restart=on-failure
+RestartSec=5
+
+# Hardening (runs as root for /dev/input + /dev/uinput access)
+NoNewPrivileges=yes
+ProtectSystem=strict
+# /etc/baan: RC config; /run/user: Wayland sockets for clipboard auto-discovery
+ReadWritePaths=/dev/input /dev/uinput /etc/baan /run/user
+
+[Install]
+WantedBy=multi-user.target
