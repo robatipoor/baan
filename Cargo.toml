@@ -5,14 +5,12 @@ edition = "2024"
 description = "A keyboard input expansion daemon that monitors keystrokes and run command"
 
 [dependencies]
-libc = "0.2.186"
-clap = { version = "4.6.1", features = ["derive", "env"] }
-toml = "0.8"
-# wayland-data-control: native Wayland clipboard on any compositor that
-# supports the protocol. Without it arboard is X11-only on Linux.
+libc = "0.2.189"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+toml = "1.1.4+spec-1.1.0"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wait-timeout = "0.2.1"
 
 [dev-dependencies]
