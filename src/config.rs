@@ -372,14 +372,17 @@ mod tests {
 
     #[test]
     fn command_timeout_secs_parsed_from_baan_table() {
-        let (settings, _) =
-            parse_config_file("[baan]\ncommand_timeout_secs = 30\n").unwrap();
+        let (settings, _) = parse_config_file("[baan]\ncommand_timeout_secs = 30\n").unwrap();
         assert_eq!(settings.command_timeout, Duration::from_secs(30));
     }
 
     #[test]
     fn command_timeout_secs_rejects_non_positive_integer() {
-        for bad in ["command_timeout_secs = 0", "command_timeout_secs = -1", "command_timeout_secs = \"30\""] {
+        for bad in [
+            "command_timeout_secs = 0",
+            "command_timeout_secs = -1",
+            "command_timeout_secs = \"30\"",
+        ] {
             let err = parse_config_file(&format!("[baan]\n{bad}")).unwrap_err();
             match err {
                 BaanError::ParseConfigFile { detail, .. } => {

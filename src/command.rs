@@ -694,11 +694,7 @@ mod tests {
 
     #[test]
     fn run_command_short_timeout_still_runs_fast_commands() {
-        let result = run_command(
-            "echo",
-            &["hi".to_string()],
-            Duration::from_secs(1),
-        );
+        let result = run_command("echo", &["hi".to_string()], Duration::from_secs(1));
         assert_eq!(result.unwrap().trim(), "hi");
     }
 }

@@ -504,13 +504,7 @@ pub fn process_keyboard_events(
             continue;
         };
 
-        feed_parser_char(
-            &mut parser,
-            c,
-            &cmd_tx,
-            trigger_commands,
-            command_timeout,
-        );
+        feed_parser_char(&mut parser, c, &cmd_tx, trigger_commands, command_timeout);
     }
 
     info!("Shutting down");
