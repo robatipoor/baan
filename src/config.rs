@@ -3,6 +3,7 @@ use tracing::warn;
 use crate::error::{BaanError, Result};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::{collections::HashMap, path::Path};
 
 pub const CONFIG_FILE_NAME: &str = "baan.toml";
@@ -32,6 +33,8 @@ pub struct Settings {
     /// Delay between writing to the clipboard and pasting, and before
     /// restoring the old clipboard value (milliseconds).
     pub clipboard_write_delay_ms: u64,
+    /// Maximum time a trigger command may run before it is killed.
+    pub command_timeout: Duration,
 }
 
 impl Default for Settings {
@@ -40,6 +43,7 @@ impl Default for Settings {
             flush_delay_ms: 100,
             clipboard_read_delay_ms: 120,
             clipboard_write_delay_ms: 80,
+            command_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -198,7 +202,10 @@ fn parse_settings(value: &toml::Value, settings: &mut Settings) -> Result<()> {
     for key in table.keys().filter(|k| {
         !matches!(
             k.as_str(),
-            "flush_delay_ms" | "clipboard_read_delay_ms" | "clipboard_write_delay_ms"
+            "flush_delay_ms"
+                | "clipboard_read_delay_ms"
+                | "clipboard_write_delay_ms"
+                | "command_timeout_secs"
         )
     }) {
         warn!(key = %key, "Unknown setting in [baan] table, ignoring");
@@ -212,6 +219,16 @@ fn parse_settings(value: &toml::Value, settings: &mut Settings) -> Result<()> {
     }
     if let Some(v) = table.get("clipboard_write_delay_ms") {
         settings.clipboard_write_delay_ms = parse_positive_u64(v, "clipboard_write_delay_ms")?;
+    }
+    if let Some(v) = table.get("command_timeout_secs") {
+        if let Some(secs) = v.as_integer().filter(|&s| s > 0) {
+            settings.command_timeout = Duration::from_secs(secs as u64);
+        } else {
+            return Err(BaanError::ParseConfigFile {
+                line: 0,
+                detail: "command_timeout_secs must be a positive integer".to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -345,6 +362,32 @@ mod tests {
         let content = r#"cmd = ["echo", 42, true, 3.5]"#;
         let (_, map) = parse_config_file(content).unwrap();
         assert_eq!(map.get("cmd").unwrap(), &vec!["echo", "42", "true", "3.5"]);
+    }
+
+    #[test]
+    fn default_settings_timeout_is_15_secs() {
+        let (settings, _) = parse_config_file("[baan]\n").unwrap();
+        assert_eq!(settings.command_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn command_timeout_secs_parsed_from_baan_table() {
+        let (settings, _) =
+            parse_config_file("[baan]\ncommand_timeout_secs = 30\n").unwrap();
+        assert_eq!(settings.command_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn command_timeout_secs_rejects_non_positive_integer() {
+        for bad in ["command_timeout_secs = 0", "command_timeout_secs = -1", "command_timeout_secs = \"30\""] {
+            let err = parse_config_file(&format!("[baan]\n{bad}")).unwrap_err();
+            match err {
+                BaanError::ParseConfigFile { detail, .. } => {
+                    assert!(detail.contains("command_timeout_secs"), "got {detail}");
+                }
+                _ => panic!("Expected ParseConfigFile error"),
+            }
+        }
     }
 
     #[test]

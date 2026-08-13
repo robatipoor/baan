@@ -6,6 +6,8 @@ clipboard_read_delay_ms = 120
 # Delay before pasting after writing to the clipboard, and before restoring
 # the previous clipboard value (ms). Prevents pasting stale clipboard content.
 clipboard_write_delay_ms = 80
+# Maximum time (seconds) a trigger command may run before it is killed
+command_timeout_secs = 15
 
 [triggers]
 hi = ["echo", "-n", "Hello World!"]

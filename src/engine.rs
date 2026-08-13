@@ -1,6 +1,6 @@
 use crate::{
     clipboard::ClipboardOps,
-    command::{expand_placeholders, has_placeholders, run_command_default},
+    command::{expand_placeholders, has_placeholders, run_command},
     config::{Settings, TriggerCommands},
     device::{KeyInjector, KeyboardDevice, VirtualDevice},
     error::Result,
@@ -48,9 +48,8 @@ enum ClipboardCommandError {
     ExpansionFailed { tag_name: String, detail: String },
 }
 
-/// Parses `captured_text`, looks up its trigger, and expands placeholders
-/// — pure, no threading, no process execution. `spawn_clipboard_command`
-/// wraps this and only adds the thread spawn + actual `run_command_default`.
+/// Resolves `captured_text` into a runnable argv: parse the tag, look up its
+/// trigger, and expand placeholders. Pure — no threads or process execution.
 fn resolve_clipboard_command(
     trigger_commands: &TriggerCommands,
     captured_text: &str,
@@ -80,9 +79,8 @@ fn resolve_clipboard_command(
     }
 }
 
-/// Expands `command`'s placeholder with `content` if present — pure, no
-/// threading, no process execution. `spawn_tag_command` wraps this and
-/// only adds the thread spawn + actual `run_command_default`.
+/// Expands `command`'s placeholders with `content` if present. Pure — no
+/// threads or process execution.
 fn resolve_tag_expansion(
     command: &str,
     options: &[String],
@@ -96,12 +94,9 @@ fn resolve_tag_expansion(
     }
 }
 
-/// Splits `input` on the **first** occurrence of `separator`.
-/// Returns `Some((tag, arg))` only if the tag part is **non‑empty**.
-/// The arg is `None` when the separator is at the very end (no argument),
-/// e.g. `date:?` → `Some(("date", None))`.
-/// Returns `None` if the separator is at the very start (tag empty)
-/// or if the input is empty.
+/// Splits `input` on the first `separator`, returning `(tag, arg)`.
+/// Returns `None` when the tag part is empty; `arg` is `None` when the
+/// separator is at the very end (e.g. `date:?`).
 pub fn parse_tag<'a>(input: &'a str, separator: &str) -> Option<(&'a str, Option<&'a str>)> {
     let (tag, arg) = input.split_once(separator)?;
     if tag.is_empty() {
@@ -118,6 +113,7 @@ fn spawn_clipboard_command(
     cmd_tx: mpsc::Sender<CommandMessage>,
     trigger_commands: &TriggerCommands,
     captured_text: &str,
+    timeout: Duration,
 ) {
     let expanded = match resolve_clipboard_command(trigger_commands, captured_text) {
         Ok(expanded) => expanded,
@@ -137,7 +133,7 @@ fn spawn_clipboard_command(
 
     let tx = cmd_tx.clone();
     thread::spawn(
-        move || match run_command_default(&expanded[0], &expanded[1..]) {
+        move || match run_command(&expanded[0], &expanded[1..], timeout) {
             Ok(output) => {
                 let _ = tx.send(CommandMessage::SetClipboard { output });
             }
@@ -159,6 +155,7 @@ fn spawn_tag_command(
     tag_text: String,
     command: String,
     options: Vec<String>,
+    timeout: Duration,
 ) {
     thread::spawn(move || {
         let command = command;
@@ -172,7 +169,7 @@ fn spawn_tag_command(
             }
         };
 
-        match run_command_default(&expanded[0], &expanded[1..]) {
+        match run_command(&expanded[0], &expanded[1..], timeout) {
             Ok(output) => {
                 debug!(tag = %tag_text, "Tag matched, output ready");
                 let _ = cmd_tx.send(CommandMessage::ReplaceTag { tag_text, output });
@@ -201,8 +198,7 @@ fn handle_set_clipboard<C, V>(
         return;
     }
 
-    // Wait for clipboard ownership to be registered before pasting;
-    // otherwise the target app may paste old content.
+    // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
 
     if let Err(e) = virtual_device.send_ctrl_v() {
@@ -238,8 +234,7 @@ where
             source: std::io::Error::other(e),
         })?;
 
-    // Wait for clipboard ownership to be registered before pasting;
-    // otherwise the target app may paste old content.
+    // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
     virtual_device.send_ctrl_v()?;
     Ok(true)
@@ -262,9 +257,7 @@ fn handle_replace_tag<C, V>(
     debug!(tag = %tag_text, "Command output received from background thread");
     thread::sleep(Duration::from_millis(settings.flush_delay_ms));
 
-    // Save the current clipboard content. If the read fails (e.g. the
-    // clipboard is empty), default to an empty string so the clipboard is
-    // restored empty afterwards.
+    // Save the clipboard so it can be restored; default to empty on failure.
     let old_clipboard = clipboard
         .get_text()
         .map(|s| s.to_string())
@@ -314,10 +307,8 @@ fn handle_replace_tag<C, V>(
             }
         };
 
-    // Restore the previous clipboard content (empty if the clipboard was
-    // empty). When the replacement was pasted from the clipboard, wait
-    // before restoring so the target app's paste request is served before
-    // we re-claim ownership.
+    // Restore the old clipboard. If the replacement was pasted from the
+    // clipboard, wait so the app's paste request is served first.
     if pasted_from_clipboard {
         thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
     }
@@ -380,6 +371,7 @@ fn feed_parser_char(
     c: char,
     cmd_tx: &mpsc::Sender<CommandMessage>,
     trigger_commands: &TriggerCommands,
+    timeout: Duration,
 ) {
     parser.consume(c);
 
@@ -400,6 +392,7 @@ fn feed_parser_char(
             tag_text,
             cmd,
             options,
+            timeout,
         );
     }
 }
@@ -418,6 +411,8 @@ pub fn process_keyboard_events(
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<CommandMessage>();
     let (kb_tx, kb_rx) = mpsc::channel::<KeyboardMessage>();
+
+    let command_timeout = settings.command_timeout;
 
     thread::spawn(move || {
         loop {
@@ -484,11 +479,13 @@ pub fn process_keyboard_events(
                 }
             };
 
-            spawn_clipboard_command(cmd_tx.clone(), trigger_commands, &captured);
+            spawn_clipboard_command(cmd_tx.clone(), trigger_commands, &captured, command_timeout);
             continue;
         }
 
         // ---- Normal tag parsing path -----------------------------------
+
+        // Only key presses (value 1) drive tag parsing.
         if value == 0 || value == 2 {
             continue;
         }
@@ -507,7 +504,13 @@ pub fn process_keyboard_events(
             continue;
         };
 
-        feed_parser_char(&mut parser, c, &cmd_tx, trigger_commands);
+        feed_parser_char(
+            &mut parser,
+            c,
+            &cmd_tx,
+            trigger_commands,
+            command_timeout,
+        );
     }
 
     info!("Shutting down");
@@ -760,6 +763,7 @@ mod tests {
             flush_delay_ms: 0,
             clipboard_read_delay_ms: 0,
             clipboard_write_delay_ms: 0,
+            command_timeout: Duration::from_secs(15),
         }
     }
 

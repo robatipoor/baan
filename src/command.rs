@@ -9,9 +9,6 @@ use wait_timeout::ChildExt;
 
 use crate::error::{BaanError, Result};
 
-/// Default command timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 15;
-
 /// Cap on captured stdout/stderr size (bytes) to avoid unbounded memory use.
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -299,11 +296,6 @@ pub fn run_command(command: &str, args: &[String], timeout: Duration) -> Result<
     }
 
     Ok(stdout)
-}
-
-/// Convenience wrapper using the default timeout.
-pub fn run_command_default(command: &str, args: &[String]) -> Result<String> {
-    run_command(command, args, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
 }
 
 /// Read a child pipe to EOF (capped) on a background thread.
@@ -701,8 +693,12 @@ mod tests {
     }
 
     #[test]
-    fn run_command_default_uses_default_timeout() {
-        let result = run_command_default("echo", &["hi".to_string()]);
+    fn run_command_short_timeout_still_runs_fast_commands() {
+        let result = run_command(
+            "echo",
+            &["hi".to_string()],
+            Duration::from_secs(1),
+        );
         assert_eq!(result.unwrap().trim(), "hi");
     }
 }

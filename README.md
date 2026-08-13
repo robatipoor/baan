@@ -106,6 +106,7 @@ Runtime settings live in a `[baan]` table (all optional):
 flush_delay_ms = 100             # delay before injecting output
 clipboard_read_delay_ms = 120    # delay before reading clipboard after Ctrl+C
 clipboard_write_delay_ms = 80    # delay before pasting after writing clipboard, and before restoring old value
+command_timeout_secs = 15        # max time a trigger command may run before being killed
 ```
 
 For backward compatibility, triggers at the top level of the file (outside any table) are still accepted.
