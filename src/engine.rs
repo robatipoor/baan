@@ -454,23 +454,25 @@ fn spawn_keyboard_reader(
     mut keyboard_device: KeyboardDevice,
     kb_tx: mpsc::Sender<KeyboardMessage>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        if TERMINATE.load(Ordering::Relaxed) {
-            break;
-        }
-        match keyboard_device.read_event() {
-            Ok(Some(event)) => {
-                if kb_tx.send(KeyboardMessage::Event(event)).is_err() {
+    thread::spawn(move || {
+        loop {
+            if TERMINATE.load(Ordering::Relaxed) {
+                break;
+            }
+            match keyboard_device.read_event() {
+                Ok(Some(event)) => {
+                    if kb_tx.send(KeyboardMessage::Event(event)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    // Interrupted by signal, check terminate flag and retry.
+                    continue;
+                }
+                Err(e) => {
+                    let _ = kb_tx.send(KeyboardMessage::Error(e.to_string()));
                     break;
                 }
-            }
-            Ok(None) => {
-                // Interrupted by signal, check terminate flag and retry.
-                continue;
-            }
-            Err(e) => {
-                let _ = kb_tx.send(KeyboardMessage::Error(e.to_string()));
-                break;
             }
         }
     })
