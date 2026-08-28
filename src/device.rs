@@ -24,39 +24,19 @@ pub const UINPUT_PATH: &str = "/dev/uinput";
 /// time to process each one before the next arrives.
 const STEP_DELAY: Duration = Duration::from_micros(SLEEP_TIME_US);
 
-/// Reinterprets an `InputEvent` as its raw wire bytes for writing to a
-/// uinput/evdev device.
-///
-/// Safety: `InputEvent` is `#[repr(C)]` and its size is checked at compile
-/// time (`_INPUT_EVENT_SIZE_CHECK`) to match the kernel's
-/// `struct input_event` exactly, so there are no interior padding bytes to
-/// worry about reading. This is the single place that unsafe cast happens;
-/// both device types below route through it.
-fn event_bytes(event: &InputEvent) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            event as *const InputEvent as *const u8,
-            std::mem::size_of::<InputEvent>(),
-        )
-    }
-}
-
-/// Reinterprets 24 freshly-read bytes as an `InputEvent`.
-///
-/// Safety: `bytes` was filled entirely by a successful read, so every byte
-/// is initialized; `InputEvent`'s fields are plain integers that accept any
-/// bit pattern. `read_unaligned` is used instead of a direct cast/transmute
-/// since the buffer isn't guaranteed to satisfy `InputEvent`'s alignment.
-fn event_from_bytes(bytes: [u8; 24]) -> InputEvent {
-    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const InputEvent) }
-}
-
 /// Key-injection operations needed by the event loop. Implemented for
 /// `VirtualDevice`; fakeable in tests.
 pub trait KeyInjector {
     fn select_line(&mut self) -> Result<()>;
+    /// Simulate Ctrl+C (copy).
     fn send_ctrl_c(&mut self) -> Result<()>;
-    fn send_ctrl_v(&mut self) -> Result<()>;
+    /// Simulate Ctrl+Shift+C (the copy shortcut in terminals, where plain
+    /// Ctrl+C means SIGINT).
+    #[allow(dead_code)]
+    fn send_ctrl_shift_c(&mut self) -> Result<()>;
+    /// Simulate Ctrl+V, or Ctrl+Shift+V when `with_shift` is set (the paste
+    /// shortcut in terminals).
+    fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()>;
     fn send_string(&mut self, s: &str) -> Result<()>;
     fn position_at_tag(&mut self, pos: usize, len: usize) -> Result<()>;
 }
@@ -205,14 +185,35 @@ impl VirtualDevice {
         action_result.and(release_result).and(sync_result)
     }
 
-    /// Simulate Ctrl+V (paste).
-    pub fn send_ctrl_v(&mut self) -> Result<()> {
+    /// Simulate Ctrl+V (paste), or Ctrl+Shift+V when `with_shift` is set
+    /// (the paste shortcut in terminals).
+    pub fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
+        if with_shift {
+            return self.with_two_modifiers(KEY_LEFTCTRL, KEY_LEFTSHIFT, |dev| dev.tap_key(KEY_V));
+        }
         self.with_modifier(KEY_LEFTCTRL, true, |dev| dev.tap_key(KEY_V))
     }
 
     /// Simulate Ctrl+C (copy).
     pub fn send_ctrl_c(&mut self) -> Result<()> {
         self.with_modifier(KEY_LEFTCTRL, true, |dev| dev.tap_key(KEY_C))
+    }
+
+    /// Simulate Ctrl+Shift+C (the copy shortcut in terminals, where plain
+    /// Ctrl+C means SIGINT).
+    pub fn send_ctrl_shift_c(&mut self) -> Result<()> {
+        self.with_two_modifiers(KEY_LEFTCTRL, KEY_LEFTSHIFT, |dev| dev.tap_key(KEY_C))
+    }
+
+    /// Holds both `first` and `second` modifiers down (in that order), runs
+    /// `action`, then releases them in reverse. The inner modifier syncs so
+    /// applications observe the full chord; releases are always attempted,
+    /// mirroring [`Self::with_modifier`].
+    fn with_two_modifiers<F>(&mut self, first: u32, second: u32, action: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        self.with_modifier(first, true, |dev| dev.with_modifier(second, false, action))
     }
 
     /// Position the cursor at `pos` in the current line and delete the
@@ -297,44 +298,6 @@ impl Drop for VirtualDevice {
         // panicking in a destructor is UB.
         let _ = self.destroy_inner();
     }
-}
-
-/// Converts an ioctl return value into a `Result`, attaching the OS's last
-/// error when the call failed (indicated by a negative return).
-fn check_ioctl_result(
-    ret: i32,
-    error_kind: impl FnOnce(String) -> BaanError,
-    detail: &str,
-) -> Result<()> {
-    if ret < 0 {
-        let os_err = std::io::Error::last_os_error();
-        return Err(error_kind(format!("{}: {}", detail, os_err)));
-    }
-    Ok(())
-}
-
-/// Perform an ioctl that returns `0` on success, `-1` on failure.
-unsafe fn ioctl(
-    fd: i32,
-    request: u64,
-    arg: u64,
-    error_kind: impl FnOnce(String) -> BaanError,
-    detail: &str,
-) -> Result<()> {
-    let ret = unsafe { libc::ioctl(fd, request as libc::c_ulong, arg as libc::c_ulong) };
-    check_ioctl_result(ret, error_kind, detail)
-}
-
-/// Same for ioctls that take a pointer argument.
-unsafe fn ioctl_ptr(
-    fd: i32,
-    request: u64,
-    arg: *const libc::c_void,
-    error_kind: impl FnOnce(String) -> BaanError,
-    detail: &str,
-) -> Result<()> {
-    let ret = unsafe { libc::ioctl(fd, request as libc::c_ulong, arg) };
-    check_ioctl_result(ret, error_kind, detail)
 }
 
 // ---- Physical keyboard device ----
@@ -436,8 +399,11 @@ impl KeyInjector for VirtualDevice {
     fn send_ctrl_c(&mut self) -> Result<()> {
         VirtualDevice::send_ctrl_c(self)
     }
-    fn send_ctrl_v(&mut self) -> Result<()> {
-        VirtualDevice::send_ctrl_v(self)
+    fn send_ctrl_shift_c(&mut self) -> Result<()> {
+        VirtualDevice::send_ctrl_shift_c(self)
+    }
+    fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
+        VirtualDevice::send_ctrl_v(self, with_shift)
     }
     fn send_string(&mut self, s: &str) -> Result<()> {
         VirtualDevice::send_string(self, s)
@@ -445,6 +411,71 @@ impl KeyInjector for VirtualDevice {
     fn position_at_tag(&mut self, pos: usize, len: usize) -> Result<()> {
         VirtualDevice::position_at_tag(self, pos, len)
     }
+}
+
+/// Reinterprets an `InputEvent` as its raw wire bytes for writing to a
+/// uinput/evdev device.
+///
+/// Safety: `InputEvent` is `#[repr(C)]` and its size is checked at compile
+/// time (`_INPUT_EVENT_SIZE_CHECK`) to match the kernel's
+/// `struct input_event` exactly, so there are no interior padding bytes to
+/// worry about reading. This is the single place that unsafe cast happens;
+/// both device types below route through it.
+fn event_bytes(event: &InputEvent) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            event as *const InputEvent as *const u8,
+            std::mem::size_of::<InputEvent>(),
+        )
+    }
+}
+
+/// Reinterprets 24 freshly-read bytes as an `InputEvent`.
+///
+/// Safety: `bytes` was filled entirely by a successful read, so every byte
+/// is initialized; `InputEvent`'s fields are plain integers that accept any
+/// bit pattern. `read_unaligned` is used instead of a direct cast/transmute
+/// since the buffer isn't guaranteed to satisfy `InputEvent`'s alignment.
+fn event_from_bytes(bytes: [u8; 24]) -> InputEvent {
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const InputEvent) }
+}
+
+/// Converts an ioctl return value into a `Result`, attaching the OS's last
+/// error when the call failed (indicated by a negative return).
+fn check_ioctl_result(
+    ret: i32,
+    error_kind: impl FnOnce(String) -> BaanError,
+    detail: &str,
+) -> Result<()> {
+    if ret < 0 {
+        let os_err = std::io::Error::last_os_error();
+        return Err(error_kind(format!("{}: {}", detail, os_err)));
+    }
+    Ok(())
+}
+
+/// Perform an ioctl that returns `0` on success, `-1` on failure.
+unsafe fn ioctl(
+    fd: i32,
+    request: u64,
+    arg: u64,
+    error_kind: impl FnOnce(String) -> BaanError,
+    detail: &str,
+) -> Result<()> {
+    let ret = unsafe { libc::ioctl(fd, request as libc::c_ulong, arg as libc::c_ulong) };
+    check_ioctl_result(ret, error_kind, detail)
+}
+
+/// Same for ioctls that take a pointer argument.
+unsafe fn ioctl_ptr(
+    fd: i32,
+    request: u64,
+    arg: *const libc::c_void,
+    error_kind: impl FnOnce(String) -> BaanError,
+    detail: &str,
+) -> Result<()> {
+    let ret = unsafe { libc::ioctl(fd, request as libc::c_ulong, arg) };
+    check_ioctl_result(ret, error_kind, detail)
 }
 
 #[cfg(test)]

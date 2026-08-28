@@ -1,14 +1,29 @@
 # baan
 
-Keyboard input expansion for Linux. Type a tag (or copy `name:?arg` and Ctrl+C), run a command, inject the output.
+Keyboard input expansion for Linux.
+Type a tag (or copy name:?arg and press Ctrl+C), run a command, then inject the output into GUI applications (excluding terminal emulators).
 
 ```text
-<hi>                 →  Hello World!
+<hi/>                →  Hello World!
 <hello>Ada</hello>   →  Hello Ada!
 base64:?secret + Ctrl+C  →  result on clipboard (paste with Ctrl+V)
 ```
 
 ![demo](baan.gif)
+
+### Tag syntax
+
+baan recognises tags in two shapes:
+
+- **Typed tags** — XML-like, typed directly into the focused app:
+  - `<name/>` — a self-closing tag with no body.
+  - `<name>body</name>` — a tag whose body is passed to the trigger.
+- **Clipboard tags** — copy `name:?arg` and press **Ctrl+C**; the text after
+  `:?` is passed to the trigger and the result is placed on the clipboard
+  for you to paste with **Ctrl+V**.
+
+In every case `{}` in the trigger command is replaced by the tag body (typed
+tag) or the text after `:?` (clipboard tag). Trigger names must be unique.
 
 Needs root (or equivalent) for `/dev/input` and `/dev/uinput`. Works on Wayland and X11.
 
@@ -113,7 +128,7 @@ For backward compatibility, triggers at the top level of the file (outside any t
 
 | Invoke | Example | Result |
 |--------|---------|--------|
-| Type tag | `<hi>` / `<hello>Ada</hello>` | Backspace tag, inject stdout into focused app |
+| Type tag | `<hi/>` / `<hello>Ada</hello>` | Backspace tag, inject stdout into focused app |
 | Clipboard | copy `base64:?secret`, **Ctrl+C** | Stdout replaces clipboard; you **Ctrl+V** to paste |
 
 `{}` is the tag body or the text after `:?`. Trigger names must be unique.

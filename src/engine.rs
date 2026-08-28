@@ -48,6 +48,104 @@ enum ClipboardCommandError {
     ExpansionFailed { tag_name: String, detail: String },
 }
 
+pub fn process_keyboard_events(
+    mut clipboard: Clipboard,
+    keyboard_device: KeyboardDevice,
+    mut virtual_device: VirtualDevice,
+    trigger_commands: &TriggerCommands,
+    settings: &Settings,
+) -> Result<()> {
+    info!("Listening for keyboard events");
+    let mut parser = TagParser::default();
+    let mut is_shifted = false;
+    let mut is_ctrl = false;
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CommandMessage>();
+    let (kb_tx, kb_rx) = mpsc::channel::<KeyboardMessage>();
+
+    let command_timeout = settings.command_timeout;
+
+    spawn_keyboard_reader(keyboard_device, kb_tx);
+
+    while !TERMINATE.load(Ordering::Relaxed) {
+        drain_command_results(&cmd_rx, &mut clipboard, &mut virtual_device, settings);
+
+        let event = match next_keyboard_event(&kb_rx) {
+            NextEvent::Some(e) => e,
+            NextEvent::None => continue,
+            NextEvent::Stop => break,
+        };
+
+        if event.r#type != EV_KEY {
+            continue;
+        }
+
+        let code = event.code as u32;
+        let value = event.value; // 0 = release, 1 = press, 2 = repeat
+
+        // ---- Track modifier state -----------------------------------------
+        if code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL {
+            is_ctrl = value != 0;
+        }
+        if code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT {
+            is_shifted = value != 0;
+        }
+
+        // Ignore modifier presses for further processing.
+        match code {
+            KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTSHIFT | KEY_RIGHTSHIFT => continue,
+            _ => {}
+        }
+
+        // ---- Intercept Ctrl+C -----------------------------------------
+        if is_ctrl && code == KEY_C && value == 1 {
+            thread::sleep(Duration::from_millis(settings.clipboard_read_delay_ms));
+
+            let captured = match clipboard.get_text() {
+                Ok(t) => t,
+                Err(_) => {
+                    warn!("Clipboard does not contain valid text");
+                    continue;
+                }
+            };
+
+            if captured.trim().is_empty() {
+                debug!("Clipboard is empty, nothing to run on Ctrl+C");
+                continue;
+            }
+
+            spawn_clipboard_command(cmd_tx.clone(), trigger_commands, &captured, command_timeout);
+            continue;
+        }
+
+        // ---- Normal tag parsing path -----------------------------------
+
+        // Only key presses (value 1) drive tag parsing.
+        if value == 0 || value == 2 {
+            continue;
+        }
+
+        if !is_supported_key_code(code) {
+            if code == KEY_BACKSPACE {
+                parser.remove_char();
+            } else {
+                parser = TagParser::default();
+            }
+            continue;
+        }
+
+        let Some(c) = get_char_from_keycode(code, is_shifted) else {
+            parser = TagParser::default();
+            continue;
+        };
+
+        feed_parser_char(&mut parser, c, &cmd_tx, trigger_commands, command_timeout);
+    }
+
+    info!("Shutting down");
+    Ok(())
+}
+
 /// Resolves `captured_text` into a runnable argv: parse the tag, look up its
 /// trigger, and expand placeholders. Pure — no threads or process execution.
 fn resolve_clipboard_command(
@@ -201,7 +299,7 @@ fn handle_set_clipboard<C, V>(
     // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
 
-    if let Err(e) = virtual_device.send_ctrl_v() {
+    if let Err(e) = virtual_device.send_ctrl_v(false) {
         error!(detail = %e, "Failed to simulate Ctrl+V");
     }
 }
@@ -236,7 +334,7 @@ where
 
     // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
-    virtual_device.send_ctrl_v()?;
+    virtual_device.send_ctrl_v(false)?;
     Ok(true)
 }
 
@@ -349,6 +447,35 @@ enum NextEvent {
     Stop,
 }
 
+/// Spawns the background thread that reads keyboard events and forwards
+/// them to the main loop via `kb_tx`. Stops when the reader errors, the
+/// channel disconnects, or `TERMINATE` is set.
+fn spawn_keyboard_reader(
+    mut keyboard_device: KeyboardDevice,
+    kb_tx: mpsc::Sender<KeyboardMessage>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        if TERMINATE.load(Ordering::Relaxed) {
+            break;
+        }
+        match keyboard_device.read_event() {
+            Ok(Some(event)) => {
+                if kb_tx.send(KeyboardMessage::Event(event)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {
+                // Interrupted by signal, check terminate flag and retry.
+                continue;
+            }
+            Err(e) => {
+                let _ = kb_tx.send(KeyboardMessage::Error(e.to_string()));
+                break;
+            }
+        }
+    })
+}
+
 fn next_keyboard_event(kb_rx: &mpsc::Receiver<KeyboardMessage>) -> NextEvent {
     match kb_rx.recv_timeout(Duration::from_millis(10)) {
         Ok(KeyboardMessage::Event(e)) => NextEvent::Some(e),
@@ -395,120 +522,6 @@ fn feed_parser_char(
             timeout,
         );
     }
-}
-
-pub fn process_keyboard_events(
-    mut clipboard: Clipboard,
-    mut keyboard_device: KeyboardDevice,
-    mut virtual_device: VirtualDevice,
-    trigger_commands: &TriggerCommands,
-    settings: &Settings,
-) -> Result<()> {
-    info!("Listening for keyboard events");
-    let mut parser = TagParser::default();
-    let mut is_shifted = false;
-    let mut is_ctrl = false;
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<CommandMessage>();
-    let (kb_tx, kb_rx) = mpsc::channel::<KeyboardMessage>();
-
-    let command_timeout = settings.command_timeout;
-
-    thread::spawn(move || {
-        loop {
-            if TERMINATE.load(Ordering::Relaxed) {
-                break;
-            }
-            match keyboard_device.read_event() {
-                Ok(Some(event)) => {
-                    if kb_tx.send(KeyboardMessage::Event(event)).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    // Interrupted by signal, check terminate flag and retry.
-                    continue;
-                }
-                Err(e) => {
-                    let _ = kb_tx.send(KeyboardMessage::Error(e.to_string()));
-                    break;
-                }
-            }
-        }
-    });
-
-    while !TERMINATE.load(Ordering::Relaxed) {
-        drain_command_results(&cmd_rx, &mut clipboard, &mut virtual_device, settings);
-
-        let event = match next_keyboard_event(&kb_rx) {
-            NextEvent::Some(e) => e,
-            NextEvent::None => continue,
-            NextEvent::Stop => break,
-        };
-
-        if event.r#type != EV_KEY {
-            continue;
-        }
-
-        let code = event.code as u32;
-        let value = event.value; // 0 = release, 1 = press, 2 = repeat
-
-        // ---- Track modifier state -----------------------------------------
-        if code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL {
-            is_ctrl = value != 0;
-        }
-        if code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT {
-            is_shifted = value != 0;
-        }
-
-        // Ignore modifier presses for further processing.
-        match code {
-            KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTSHIFT | KEY_RIGHTSHIFT => continue,
-            _ => {}
-        }
-
-        // ---- Intercept Ctrl+C -----------------------------------------
-        if is_ctrl && code == KEY_C && value == 1 {
-            thread::sleep(Duration::from_millis(settings.clipboard_read_delay_ms));
-
-            let captured = match clipboard.get_text() {
-                Ok(t) => t,
-                Err(_) => {
-                    warn!("Clipboard does not contain valid text");
-                    continue;
-                }
-            };
-
-            spawn_clipboard_command(cmd_tx.clone(), trigger_commands, &captured, command_timeout);
-            continue;
-        }
-
-        // ---- Normal tag parsing path -----------------------------------
-
-        // Only key presses (value 1) drive tag parsing.
-        if value == 0 || value == 2 {
-            continue;
-        }
-
-        if !is_supported_key_code(code) {
-            if code == KEY_BACKSPACE {
-                parser.remove_char();
-            } else {
-                parser = TagParser::default();
-            }
-            continue;
-        }
-
-        let Some(c) = get_char_from_keycode(code, is_shifted) else {
-            parser = TagParser::default();
-            continue;
-        };
-
-        feed_parser_char(&mut parser, c, &cmd_tx, trigger_commands, command_timeout);
-    }
-
-    info!("Shutting down");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -741,7 +754,10 @@ mod tests {
         fn send_ctrl_c(&mut self) -> Result<()> {
             self.maybe_fail("send_ctrl_c")
         }
-        fn send_ctrl_v(&mut self) -> Result<()> {
+        fn send_ctrl_shift_c(&mut self) -> Result<()> {
+            self.maybe_fail("send_ctrl_shift_c")
+        }
+        fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
             self.maybe_fail("send_ctrl_v")
         }
         fn send_string(&mut self, _s: &str) -> Result<()> {
@@ -929,8 +945,11 @@ mod tests {
             fn send_ctrl_c(&mut self) -> Result<()> {
                 self.0.borrow_mut().send_ctrl_c()
             }
-            fn send_ctrl_v(&mut self) -> Result<()> {
-                self.0.borrow_mut().send_ctrl_v()
+            fn send_ctrl_shift_c(&mut self) -> Result<()> {
+                self.0.borrow_mut().send_ctrl_shift_c()
+            }
+            fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
+                self.0.borrow_mut().send_ctrl_v(with_shift)
             }
             fn send_string(&mut self, s: &str) -> Result<()> {
                 self.0.borrow_mut().send_string(s)
