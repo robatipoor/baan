@@ -299,7 +299,7 @@ fn handle_set_clipboard<C, V>(
     // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
 
-    if let Err(e) = virtual_device.send_ctrl_v(false) {
+    if let Err(e) = virtual_device.send_ctrl_v() {
         error!(detail = %e, "Failed to simulate Ctrl+V");
     }
 }
@@ -334,7 +334,7 @@ where
 
     // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
-    virtual_device.send_ctrl_v(false)?;
+    virtual_device.send_ctrl_v()?;
     Ok(true)
 }
 
@@ -759,8 +759,11 @@ mod tests {
         fn send_ctrl_shift_c(&mut self) -> Result<()> {
             self.maybe_fail("send_ctrl_shift_c")
         }
-        fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
+        fn send_ctrl_v(&mut self) -> Result<()> {
             self.maybe_fail("send_ctrl_v")
+        }
+        fn send_ctrl_shift_v(&mut self) -> Result<()> {
+            self.maybe_fail("send_ctrl_shift_v")
         }
         fn send_string(&mut self, _s: &str) -> Result<()> {
             self.maybe_fail("send_string")
@@ -950,8 +953,11 @@ mod tests {
             fn send_ctrl_shift_c(&mut self) -> Result<()> {
                 self.0.borrow_mut().send_ctrl_shift_c()
             }
-            fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
-                self.0.borrow_mut().send_ctrl_v(with_shift)
+            fn send_ctrl_v(&mut self) -> Result<()> {
+                self.0.borrow_mut().send_ctrl_v()
+            }
+            fn send_ctrl_shift_v(&mut self) -> Result<()> {
+                self.0.borrow_mut().send_ctrl_shift_v()
             }
             fn send_string(&mut self, s: &str) -> Result<()> {
                 self.0.borrow_mut().send_string(s)

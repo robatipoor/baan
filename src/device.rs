@@ -34,9 +34,11 @@ pub trait KeyInjector {
     /// Ctrl+C means SIGINT).
     #[allow(dead_code)]
     fn send_ctrl_shift_c(&mut self) -> Result<()>;
-    /// Simulate Ctrl+V, or Ctrl+Shift+V when `with_shift` is set (the paste
-    /// shortcut in terminals).
-    fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()>;
+    /// Simulate Ctrl+V (paste).
+    fn send_ctrl_v(&mut self) -> Result<()>;
+    /// Simulate Ctrl+Shift+V (the paste shortcut in terminals).
+    #[allow(dead_code)]
+    fn send_ctrl_shift_v(&mut self) -> Result<()>;
     fn send_string(&mut self, s: &str) -> Result<()>;
     fn position_at_tag(&mut self, pos: usize, len: usize) -> Result<()>;
 }
@@ -185,13 +187,14 @@ impl VirtualDevice {
         action_result.and(release_result).and(sync_result)
     }
 
-    /// Simulate Ctrl+V (paste), or Ctrl+Shift+V when `with_shift` is set
-    /// (the paste shortcut in terminals).
-    pub fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
-        if with_shift {
-            return self.with_two_modifiers(KEY_LEFTCTRL, KEY_LEFTSHIFT, |dev| dev.tap_key(KEY_V));
-        }
+    /// Simulate Ctrl+V (paste).
+    pub fn send_ctrl_v(&mut self) -> Result<()> {
         self.with_modifier(KEY_LEFTCTRL, true, |dev| dev.tap_key(KEY_V))
+    }
+
+    /// Simulate Ctrl+Shift+V (the paste shortcut in terminals).
+    pub fn send_ctrl_shift_v(&mut self) -> Result<()> {
+        self.with_two_modifiers(KEY_LEFTCTRL, KEY_LEFTSHIFT, |dev| dev.tap_key(KEY_V))
     }
 
     /// Simulate Ctrl+C (copy).
@@ -402,8 +405,11 @@ impl KeyInjector for VirtualDevice {
     fn send_ctrl_shift_c(&mut self) -> Result<()> {
         VirtualDevice::send_ctrl_shift_c(self)
     }
-    fn send_ctrl_v(&mut self, with_shift: bool) -> Result<()> {
-        VirtualDevice::send_ctrl_v(self, with_shift)
+    fn send_ctrl_v(&mut self) -> Result<()> {
+        VirtualDevice::send_ctrl_v(self)
+    }
+    fn send_ctrl_shift_v(&mut self) -> Result<()> {
+        VirtualDevice::send_ctrl_shift_v(self)
     }
     fn send_string(&mut self, s: &str) -> Result<()> {
         VirtualDevice::send_string(self, s)
