@@ -1,3 +1,14 @@
+//! The keyboard event loop and command injection.
+//!
+//! A background thread ([`spawn_keyboard_reader`]) reads raw key events from
+//! the physical keyboard and forwards them to the main loop
+//! ([`run_keyboard_event_loop`]). The loop tracks modifier state, intercepts
+//! copy gestures (Ctrl+C / Ctrl+Shift+C) to trigger clipboard commands, and
+//! feeds typed characters into the [`TagParser`]. When a tag matches a
+//! configured trigger, the command runs on a background thread and its output
+//! comes back as a [`CommandResult`], which the loop applies by typing or
+//! pasting into the focused application.
+
 use crate::{
     clipboard::ClipboardOps,
     command::{expand_placeholders, has_placeholders, run_command},
@@ -22,8 +33,24 @@ use tracing::{debug, error, info, warn};
 /// Delay between line-selection steps during injection (milliseconds).
 const SELECT_STEP_DELAY_MS: u64 = 50;
 
-/// Messages from the keyboard reader thread to the main event loop.
-enum KeyboardMessage {
+/// Which kind of application is the injection target.
+///
+/// Terminals differ from GUI apps in two ways that matter here: they use
+/// Ctrl+Shift+C / Ctrl+Shift+V instead of Ctrl+C / Ctrl+V, and they don't
+/// support Home/End-based keyboard selection. The target is inferred from the
+/// user's own input (all-caps tag names, the Ctrl+Shift+C gesture) rather
+/// than from window detection, which is not reliably available on every
+/// compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A regular desktop application.
+    Gui,
+    /// A terminal emulator.
+    Terminal,
+}
+
+/// Messages sent from the keyboard reader thread to the main event loop.
+enum KeyboardReaderMessage {
     /// A keyboard event was read successfully.
     Event(InputEvent),
     /// The keyboard read returned an error.
@@ -31,24 +58,39 @@ enum KeyboardMessage {
 }
 
 /// Command results sent back from background threads to the event loop.
-enum CommandMessage {
+enum CommandResult {
     /// A tag was expanded inside the current line; replace the tag text.
-    ReplaceTag { tag_text: String, output: String },
+    ReplaceTag {
+        tag_text: String,
+        output: String,
+        target: TargetKind,
+    },
     /// A clipboard command finished; put the output on the clipboard and paste.
-    SetClipboard { output: String },
+    /// `trigger_len` is the length (in characters) of the `name:?arg` trigger
+    /// text that was captured — needed so terminal targets can backspace it
+    /// off the command line before pasting.
+    SetClipboard {
+        output: String,
+        target: TargetKind,
+        trigger_len: usize,
+    },
 }
 
 /// Reason a clipboard-triggered command couldn't be resolved into a
 /// runnable argv, extracted so tests can check *why* without spawning
 /// a thread or running a process.
 #[derive(Debug, PartialEq, Eq)]
-enum ClipboardCommandError {
+enum ClipboardTagError {
     NoTag,
     UnknownTag { tag_name: String },
     ExpansionFailed { tag_name: String, detail: String },
 }
 
-pub fn process_keyboard_events(
+/// Runs the main keyboard event loop until `TERMINATE` is set.
+///
+/// Opens no devices itself — the caller provides the physical keyboard
+/// reader, the virtual injection device, and the clipboard.
+pub fn run_keyboard_event_loop(
     mut clipboard: Clipboard,
     keyboard_device: KeyboardDevice,
     mut virtual_device: VirtualDevice,
@@ -60,20 +102,22 @@ pub fn process_keyboard_events(
     let mut is_shifted = false;
     let mut is_ctrl = false;
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<CommandMessage>();
-    let (kb_tx, kb_rx) = mpsc::channel::<KeyboardMessage>();
+    // Commands run on background threads and send their results back here.
+    let (result_tx, result_rx) = mpsc::channel::<CommandResult>();
+    // The keyboard reader thread forwards raw events here.
+    let (reader_tx, reader_rx) = mpsc::channel::<KeyboardReaderMessage>();
 
     let command_timeout = settings.command_timeout;
 
-    spawn_keyboard_reader(keyboard_device, kb_tx);
+    spawn_keyboard_reader(keyboard_device, reader_tx);
 
     while !TERMINATE.load(Ordering::Relaxed) {
-        drain_command_results(&cmd_rx, &mut clipboard, &mut virtual_device, settings);
+        drain_command_results(&result_rx, &mut clipboard, &mut virtual_device, settings);
 
-        let event = match next_keyboard_event(&kb_rx) {
-            NextEvent::Some(e) => e,
-            NextEvent::None => continue,
-            NextEvent::Stop => break,
+        let event = match next_keyboard_event(&reader_rx) {
+            NextKeyboardEvent::Some(e) => e,
+            NextKeyboardEvent::None => continue,
+            NextKeyboardEvent::Stop => break,
         };
 
         if event.r#type != EV_KEY {
@@ -97,24 +141,21 @@ pub fn process_keyboard_events(
             _ => {}
         }
 
-        // ---- Intercept Ctrl+C -----------------------------------------
+        // ---- Intercept copy gestures --------------------------------------
+        //
+        // Ctrl+C is the copy gesture in GUI apps; Ctrl+Shift+C is the copy
+        // gesture in terminals (where plain Ctrl+C means SIGINT). Both are
+        // checked for a `name:?arg` tag in the clipboard; the inferred target
+        // decides which paste shortcut the result is injected with.
         if is_ctrl && code == KEY_C && value == 1 {
-            thread::sleep(Duration::from_millis(settings.clipboard_read_delay_ms));
-
-            let captured = match clipboard.get_text() {
-                Ok(t) => t,
-                Err(_) => {
-                    warn!("Clipboard does not contain valid text");
-                    continue;
-                }
-            };
-
-            if captured.trim().is_empty() {
-                debug!("Clipboard is empty, nothing to run on Ctrl+C");
-                continue;
-            }
-
-            spawn_clipboard_command(cmd_tx.clone(), trigger_commands, &captured, command_timeout);
+            intercept_clipboard_trigger(
+                is_shifted,
+                &mut clipboard,
+                &result_tx,
+                trigger_commands,
+                command_timeout,
+                Duration::from_millis(settings.clipboard_read_delay_ms),
+            );
             continue;
         }
 
@@ -139,11 +180,54 @@ pub fn process_keyboard_events(
             continue;
         };
 
-        feed_parser_char(&mut parser, c, &cmd_tx, trigger_commands, command_timeout);
+        feed_parser_char(
+            &mut parser,
+            c,
+            &result_tx,
+            trigger_commands,
+            command_timeout,
+        );
     }
 
     info!("Shutting down");
     Ok(())
+}
+
+/// Handles a copy gesture (Ctrl+C or Ctrl+Shift+C): waits for the copy to
+/// land, reads the clipboard, and if it holds a `name:?arg` tag, spawns the
+/// trigger's command on a background thread. The event is always consumed,
+/// even when the clipboard holds no tag.
+fn intercept_clipboard_trigger<C: ClipboardOps>(
+    is_shifted: bool,
+    clipboard: &mut C,
+    result_tx: &mpsc::Sender<CommandResult>,
+    trigger_commands: &TriggerCommands,
+    command_timeout: Duration,
+    clipboard_read_delay: Duration,
+) {
+    thread::sleep(clipboard_read_delay);
+
+    let captured_text = match clipboard.get_text() {
+        Ok(t) => t,
+        Err(_) => {
+            warn!("Clipboard does not contain valid text");
+            return;
+        }
+    };
+
+    if captured_text.trim().is_empty() {
+        debug!("Clipboard is empty, nothing to run on copy");
+        return;
+    }
+
+    let target = infer_clipboard_target(is_shifted, &captured_text);
+    spawn_clipboard_command(
+        result_tx.clone(),
+        trigger_commands,
+        &captured_text,
+        command_timeout,
+        target,
+    );
 }
 
 /// Resolves `captured_text` into a runnable argv: parse the tag, look up its
@@ -151,12 +235,12 @@ pub fn process_keyboard_events(
 fn resolve_clipboard_command(
     trigger_commands: &TriggerCommands,
     captured_text: &str,
-) -> std::result::Result<Vec<String>, ClipboardCommandError> {
-    let (tag_name, arg) = parse_tag(captured_text, ":?").ok_or(ClipboardCommandError::NoTag)?;
-    let command = match trigger_commands.get(tag_name.trim()) {
+) -> std::result::Result<Vec<String>, ClipboardTagError> {
+    let (tag_name, arg) = parse_tag(captured_text, ":?").ok_or(ClipboardTagError::NoTag)?;
+    let command = match lookup_trigger(trigger_commands, tag_name.trim()) {
         Some(cmd) if !cmd.is_empty() => cmd,
         _ => {
-            return Err(ClipboardCommandError::UnknownTag {
+            return Err(ClipboardTagError::UnknownTag {
                 tag_name: tag_name.to_string(),
             });
         }
@@ -164,16 +248,56 @@ fn resolve_clipboard_command(
 
     match arg {
         Some(a) => expand_placeholders(&command[0], &command[1..], &[a]).map_err(|e| {
-            ClipboardCommandError::ExpansionFailed {
+            ClipboardTagError::ExpansionFailed {
                 tag_name: tag_name.to_string(),
                 detail: e.to_string(),
             }
         }),
-        None if has_placeholders(command) => Err(ClipboardCommandError::ExpansionFailed {
+        None if has_placeholders(command) => Err(ClipboardTagError::ExpansionFailed {
             tag_name: tag_name.to_string(),
             detail: "Command requires an argument but none was provided".to_string(),
         }),
         None => Ok(command.to_vec()),
+    }
+}
+
+/// Case-insensitive lookup of a trigger command.
+///
+/// Config parsing rejects triggers that differ only by letter case, so at
+/// most one key can match `name`.
+fn lookup_trigger<'a>(
+    trigger_commands: &'a TriggerCommands,
+    name: &str,
+) -> Option<&'a Vec<String>> {
+    trigger_commands
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, command)| command)
+}
+
+/// Target inferred from a typed tag's name: a name with no lowercase letters
+/// (e.g. `<HI/>`, `<BASE64/>`) is the user's signal that they are typing in a
+/// terminal.
+fn infer_target_from_tag_name(tag_name: &str) -> TargetKind {
+    if tag_name.chars().all(|c| !c.is_ascii_lowercase()) {
+        TargetKind::Terminal
+    } else {
+        TargetKind::Gui
+    }
+}
+
+/// Target inferred for a clipboard-triggered command: Ctrl+Shift+C is the
+/// terminal copy gesture, so a shifted Ctrl+C always means terminal. Without
+/// shift, the all-caps tag-name convention applies (e.g. `NAME:?arg`).
+fn infer_clipboard_target(is_shifted: bool, captured: &str) -> TargetKind {
+    if is_shifted {
+        return TargetKind::Terminal;
+    }
+    match parse_tag(captured, ":?").map(|(name, _)| name.trim()) {
+        Some(name) if infer_target_from_tag_name(name) == TargetKind::Terminal => {
+            TargetKind::Terminal
+        }
+        _ => TargetKind::Gui,
     }
 }
 
@@ -206,34 +330,43 @@ pub fn parse_tag<'a>(input: &'a str, separator: &str) -> Option<(&'a str, Option
 
 /// Look up the command configured for `captured_text` (via `parse_tag`),
 /// expand placeholders, and run it on a background thread. The output is sent
-/// back as `CommandMessage::SetClipboard` so the event loop stays responsive.
+/// back as `CommandResult::SetClipboard` so the event loop stays responsive.
 fn spawn_clipboard_command(
-    cmd_tx: mpsc::Sender<CommandMessage>,
+    result_tx: mpsc::Sender<CommandResult>,
     trigger_commands: &TriggerCommands,
     captured_text: &str,
     timeout: Duration,
+    target: TargetKind,
 ) {
     let expanded = match resolve_clipboard_command(trigger_commands, captured_text) {
         Ok(expanded) => expanded,
-        Err(ClipboardCommandError::NoTag) => {
-            warn!("Clipboard text does not contain a valid tag");
+        Err(ClipboardTagError::NoTag) => {
+            // Expected case: most copied text isn't a `name:?arg` tag (and
+            // Ctrl+Shift+C is used for any terminal copy), so don't spam logs.
+            debug!("Clipboard text does not contain a valid tag");
             return;
         }
-        Err(ClipboardCommandError::UnknownTag { tag_name }) => {
+        Err(ClipboardTagError::UnknownTag { tag_name }) => {
             warn!(tag = %tag_name, "No command configured for tag");
             return;
         }
-        Err(ClipboardCommandError::ExpansionFailed { tag_name, detail }) => {
+        Err(ClipboardTagError::ExpansionFailed { tag_name, detail }) => {
             warn!(tag = %tag_name, detail = %detail, "Failed to expand command placeholders");
             return;
         }
     };
 
-    let tx = cmd_tx.clone();
+    let trigger_len = captured_text.chars().count();
+
+    let tx = result_tx.clone();
     thread::spawn(
         move || match run_command(&expanded[0], &expanded[1..], timeout) {
             Ok(output) => {
-                let _ = tx.send(CommandMessage::SetClipboard { output });
+                let _ = tx.send(CommandResult::SetClipboard {
+                    output,
+                    target,
+                    trigger_len,
+                });
             }
             Err(err) => error!(detail = %err, "Command execution failed"),
         },
@@ -247,13 +380,14 @@ fn spawn_clipboard_command(
 /// this is almost always a misconfigured `{}` count in `baan.toml`, and the
 /// user should hear about it.
 fn spawn_tag_command(
-    cmd_tx: mpsc::Sender<CommandMessage>,
+    result_tx: mpsc::Sender<CommandResult>,
     tag_name: String,
     content: Option<String>,
     tag_text: String,
     command: String,
     options: Vec<String>,
     timeout: Duration,
+    target: TargetKind,
 ) {
     thread::spawn(move || {
         let command = command;
@@ -270,7 +404,11 @@ fn spawn_tag_command(
         match run_command(&expanded[0], &expanded[1..], timeout) {
             Ok(output) => {
                 debug!(tag = %tag_text, "Tag matched, output ready");
-                let _ = cmd_tx.send(CommandMessage::ReplaceTag { tag_text, output });
+                let _ = result_tx.send(CommandResult::ReplaceTag {
+                    tag_text,
+                    output,
+                    target,
+                });
             }
             Err(err) => {
                 error!(tag = %tag_name, detail = %err, "Failed to execute command");
@@ -279,10 +417,23 @@ fn spawn_tag_command(
     });
 }
 
-/// Pastes `output` via the clipboard: sets clipboard text, waits for
-/// ownership to register, then simulates Ctrl+V.
+/// Simulates the paste shortcut for `target`: Ctrl+V in GUI apps, Ctrl+Shift+V
+/// in terminals.
+fn paste_shortcut<V: KeyInjector>(virtual_device: &mut V, target: TargetKind) -> Result<()> {
+    match target {
+        TargetKind::Gui => virtual_device.send_ctrl_v(),
+        TargetKind::Terminal => virtual_device.send_ctrl_shift_v(),
+    }
+}
+
+/// Applies a `SetClipboard` result: in terminals, first deletes the trigger
+/// text (the `name:?arg` the user had on the command line — paste doesn't
+/// replace a selection there like it does in GUI apps), then puts `output` on
+/// the clipboard and pastes with the shortcut for `target`.
 fn handle_set_clipboard<C, V>(
     output: String,
+    target: TargetKind,
+    trigger_len: usize,
     clipboard: &mut C,
     virtual_device: &mut V,
     settings: &Settings,
@@ -290,6 +441,15 @@ fn handle_set_clipboard<C, V>(
     C: ClipboardOps,
     V: KeyInjector,
 {
+    // In a terminal the trigger text stays visible after the copy gesture, so
+    // backspace it away before pasting the output. A failure here is logged
+    // but doesn't stop the paste — the output is on the clipboard either way.
+    if target == TargetKind::Terminal {
+        if let Err(e) = virtual_device.send_backspace(trigger_len) {
+            error!(detail = %e, "Failed to delete trigger text in terminal");
+        }
+    }
+
     let trimmed = output.trim_end().to_owned();
     if let Err(e) = clipboard.set_text(&trimmed) {
         error!(detail = %e, "Failed to set clipboard text");
@@ -299,19 +459,20 @@ fn handle_set_clipboard<C, V>(
     // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
 
-    if let Err(e) = virtual_device.send_ctrl_v() {
-        error!(detail = %e, "Failed to simulate Ctrl+V");
+    if let Err(e) = paste_shortcut(virtual_device, target) {
+        error!(detail = %e, "Failed to simulate paste");
     }
 }
 
 /// Types `replacement` directly if it's ASCII, otherwise round-trips it
 /// through the clipboard (for characters the virtual keyboard can't emit
-/// directly) and pastes with Ctrl+V.
+/// directly) and pastes with the shortcut for `target`.
 ///
 /// Returns whether the clipboard was used, so the caller knows whether to
 /// wait before restoring the previous clipboard contents.
 fn inject_replacement<C, V>(
     replacement: &str,
+    target: TargetKind,
     clipboard: &mut C,
     virtual_device: &mut V,
     settings: &Settings,
@@ -334,17 +495,24 @@ where
 
     // Wait for clipboard ownership to register before pasting.
     thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
-    virtual_device.send_ctrl_v()?;
+    paste_shortcut(virtual_device, target)?;
     Ok(true)
 }
 
-/// Replaces `tag_text` on the current line with `output`, by:
-/// selecting and copying the line to locate the tag, moving the cursor to
-/// it, deleting it, and typing/pasting the replacement — then restoring
+/// Replaces `tag_text` on the current line with `output`.
+///
+/// GUI path: selects and copies the line to locate the tag, moves the cursor
+/// to it, deletes it, and types/pastes the replacement — then restores
 /// whatever was on the clipboard beforehand.
+///
+/// Terminal path: terminals can't select/copy a line via keyboard (no
+/// Home/End support, Ctrl+C is SIGINT), so instead we rely on the fact that
+/// the cursor is directly after the tag when it fired: delete it with plain
+/// backspaces and type/paste the replacement.
 fn handle_replace_tag<C, V>(
     tag_text: String,
     output: String,
+    target: TargetKind,
     clipboard: &mut C,
     virtual_device: &mut V,
     settings: &Settings,
@@ -355,6 +523,43 @@ fn handle_replace_tag<C, V>(
     debug!(tag = %tag_text, "Command output received from background thread");
     thread::sleep(Duration::from_millis(settings.flush_delay_ms));
 
+    let replacement = output.trim_end();
+
+    if target == TargetKind::Terminal {
+        // Save the clipboard so it can be restored; default to empty on failure.
+        let old_clipboard = clipboard
+            .get_text()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        if let Err(e) = virtual_device.send_backspace(tag_text.chars().count()) {
+            error!(detail = %e, "Failed to delete tag in terminal");
+            return;
+        }
+
+        let pasted_from_clipboard =
+            match inject_replacement(replacement, target, clipboard, virtual_device, settings) {
+                Ok(used_clipboard) => used_clipboard,
+                Err(e) => {
+                    error!(detail = %e, "Failed to inject replacement text");
+                    return;
+                }
+            };
+
+        // Only when the replacement was pasted from the clipboard (non-ASCII)
+        // do we need to restore what was there before — the ASCII path never
+        // touched the clipboard, so leave it alone.
+        if pasted_from_clipboard {
+            // Wait so the app's paste request is served first.
+            thread::sleep(Duration::from_millis(settings.clipboard_write_delay_ms));
+            if let Err(e) = clipboard.set_text(&old_clipboard) {
+                error!(detail = %e, "Failed to set clipboard old value");
+            }
+        }
+        return;
+    }
+
+    // ---- GUI path ------------------------------------------------------
     // Save the clipboard so it can be restored; default to empty on failure.
     let old_clipboard = clipboard
         .get_text()
@@ -389,7 +594,6 @@ fn handle_replace_tag<C, V>(
     };
     let pos_chars = line_text[..pos].chars().count();
     let tag_len_chars = tag_text.chars().count();
-    let replacement = output.trim_end();
 
     if let Err(e) = virtual_device.position_at_tag(pos_chars, tag_len_chars) {
         error!(detail = %e, "Failed to position cursor at tag");
@@ -397,7 +601,7 @@ fn handle_replace_tag<C, V>(
     }
 
     let pasted_from_clipboard =
-        match inject_replacement(replacement, clipboard, virtual_device, settings) {
+        match inject_replacement(replacement, target, clipboard, virtual_device, settings) {
             Ok(used_clipboard) => used_clipboard,
             Err(e) => {
                 error!(detail = %e, "Failed to inject replacement text");
@@ -417,7 +621,7 @@ fn handle_replace_tag<C, V>(
 
 /// Drains all currently-available command results and applies them.
 fn drain_command_results<C, V>(
-    cmd_rx: &mpsc::Receiver<CommandMessage>,
+    result_rx: &mpsc::Receiver<CommandResult>,
     clipboard: &mut C,
     virtual_device: &mut V,
     settings: &Settings,
@@ -425,20 +629,42 @@ fn drain_command_results<C, V>(
     C: ClipboardOps,
     V: KeyInjector,
 {
-    while let Ok(msg) = cmd_rx.try_recv() {
-        match msg {
-            CommandMessage::SetClipboard { output } => {
-                handle_set_clipboard(output, clipboard, virtual_device, settings);
+    while let Ok(result) = result_rx.try_recv() {
+        match result {
+            CommandResult::SetClipboard {
+                output,
+                target,
+                trigger_len,
+            } => {
+                handle_set_clipboard(
+                    output,
+                    target,
+                    trigger_len,
+                    clipboard,
+                    virtual_device,
+                    settings,
+                );
             }
-            CommandMessage::ReplaceTag { tag_text, output } => {
-                handle_replace_tag(tag_text, output, clipboard, virtual_device, settings);
+            CommandResult::ReplaceTag {
+                tag_text,
+                output,
+                target,
+            } => {
+                handle_replace_tag(
+                    tag_text,
+                    output,
+                    target,
+                    clipboard,
+                    virtual_device,
+                    settings,
+                );
             }
         }
     }
 }
 
 /// Outcome of trying to fetch the next keyboard event.
-enum NextEvent {
+enum NextKeyboardEvent {
     /// A key event to process.
     Some(InputEvent),
     /// No event yet; caller should loop back around.
@@ -448,11 +674,11 @@ enum NextEvent {
 }
 
 /// Spawns the background thread that reads keyboard events and forwards
-/// them to the main loop via `kb_tx`. Stops when the reader errors, the
+/// them to the main loop via `reader_tx`. Stops when the reader errors, the
 /// channel disconnects, or `TERMINATE` is set.
 fn spawn_keyboard_reader(
     mut keyboard_device: KeyboardDevice,
-    kb_tx: mpsc::Sender<KeyboardMessage>,
+    reader_tx: mpsc::Sender<KeyboardReaderMessage>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         loop {
@@ -461,7 +687,7 @@ fn spawn_keyboard_reader(
             }
             match keyboard_device.read_event() {
                 Ok(Some(event)) => {
-                    if kb_tx.send(KeyboardMessage::Event(event)).is_err() {
+                    if reader_tx.send(KeyboardReaderMessage::Event(event)).is_err() {
                         break;
                     }
                 }
@@ -470,7 +696,7 @@ fn spawn_keyboard_reader(
                     continue;
                 }
                 Err(e) => {
-                    let _ = kb_tx.send(KeyboardMessage::Error(e.to_string()));
+                    let _ = reader_tx.send(KeyboardReaderMessage::Error(e.to_string()));
                     break;
                 }
             }
@@ -478,17 +704,17 @@ fn spawn_keyboard_reader(
     })
 }
 
-fn next_keyboard_event(kb_rx: &mpsc::Receiver<KeyboardMessage>) -> NextEvent {
-    match kb_rx.recv_timeout(Duration::from_millis(10)) {
-        Ok(KeyboardMessage::Event(e)) => NextEvent::Some(e),
-        Ok(KeyboardMessage::Error(e)) => {
+fn next_keyboard_event(reader_rx: &mpsc::Receiver<KeyboardReaderMessage>) -> NextKeyboardEvent {
+    match reader_rx.recv_timeout(Duration::from_millis(10)) {
+        Ok(KeyboardReaderMessage::Event(e)) => NextKeyboardEvent::Some(e),
+        Ok(KeyboardReaderMessage::Error(e)) => {
             error!(detail = %e, "Keyboard read error");
-            NextEvent::Stop
+            NextKeyboardEvent::Stop
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => NextEvent::None,
+        Err(mpsc::RecvTimeoutError::Timeout) => NextKeyboardEvent::None,
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             error!("Keyboard reader thread disconnected");
-            NextEvent::Stop
+            NextKeyboardEvent::Stop
         }
     }
 }
@@ -498,7 +724,7 @@ fn next_keyboard_event(kb_rx: &mpsc::Receiver<KeyboardMessage>) -> NextEvent {
 fn feed_parser_char(
     parser: &mut TagParser,
     c: char,
-    cmd_tx: &mpsc::Sender<CommandMessage>,
+    result_tx: &mpsc::Sender<CommandResult>,
     trigger_commands: &TriggerCommands,
     timeout: Duration,
 ) {
@@ -506,22 +732,27 @@ fn feed_parser_char(
 
     if let Some((tag_name, content, tag_text)) = parser.take() {
         let tag_name_trimmed = tag_name.trim();
-        let command = match trigger_commands.get(tag_name_trimmed) {
+        let command = match lookup_trigger(trigger_commands, tag_name_trimmed) {
             Some(c) if !c.is_empty() => c,
             _ => return,
         };
+
+        // The tag's casing tells us the target: all-caps names (e.g. `<HI/>`)
+        // are the user's signal that they are in a terminal.
+        let target = infer_target_from_tag_name(tag_name_trimmed);
 
         let cmd = command[0].clone();
         let options = command[1..].to_vec();
 
         spawn_tag_command(
-            cmd_tx.clone(),
+            result_tx.clone(),
             tag_name_trimmed.to_string(),
             content,
             tag_text,
             cmd,
             options,
             timeout,
+            target,
         );
     }
 }
@@ -594,27 +825,21 @@ mod tests {
     fn resolve_clipboard_command_no_tag() {
         let commands = triggers(&[]);
         let result = resolve_clipboard_command(&commands, "no separator here");
-        assert_eq!(result, Err(ClipboardCommandError::NoTag));
+        assert_eq!(result, Err(ClipboardTagError::NoTag));
     }
 
     #[test]
     fn resolve_clipboard_command_unknown_tag() {
         let commands = triggers(&[("known", &["echo", "{}"])]);
         let result = resolve_clipboard_command(&commands, "unknown:?arg");
-        assert!(matches!(
-            result,
-            Err(ClipboardCommandError::UnknownTag { .. })
-        ));
+        assert!(matches!(result, Err(ClipboardTagError::UnknownTag { .. })));
     }
 
     #[test]
     fn resolve_clipboard_command_empty_command_treated_as_unknown() {
         let commands = triggers(&[("empty", &[])]);
         let result = resolve_clipboard_command(&commands, "empty:?arg");
-        assert!(matches!(
-            result,
-            Err(ClipboardCommandError::UnknownTag { .. })
-        ));
+        assert!(matches!(result, Err(ClipboardTagError::UnknownTag { .. })));
     }
 
     #[test]
@@ -643,11 +868,11 @@ mod tests {
     #[test]
     fn resolve_clipboard_command_no_arg_with_placeholder_errors() {
         let commands = triggers(&[("greet", &["echo", "{}"])]);
-        let result: std::prelude::v1::Result<Vec<String>, ClipboardCommandError> =
+        let result: std::prelude::v1::Result<Vec<String>, ClipboardTagError> =
             resolve_clipboard_command(&commands, "greet:?");
         assert!(matches!(
             result,
-            Err(ClipboardCommandError::ExpansionFailed { .. })
+            Err(ClipboardTagError::ExpansionFailed { .. })
         ));
     }
 
@@ -656,11 +881,11 @@ mod tests {
         // Two placeholders, only one replacement available -> should error,
         // not silently drop or duplicate (per command.rs's expand_placeholders).
         let commands = triggers(&[("dup", &["echo", "{}", "{}"])]);
-        let result: std::prelude::v1::Result<Vec<String>, ClipboardCommandError> =
+        let result: std::prelude::v1::Result<Vec<String>, ClipboardTagError> =
             resolve_clipboard_command(&commands, "dup:?value");
         assert!(matches!(
             result,
-            Err(ClipboardCommandError::ExpansionFailed { .. })
+            Err(ClipboardTagError::ExpansionFailed { .. })
         ));
     }
 
@@ -725,7 +950,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeKeyInjector {
-        calls: Vec<&'static str>,
+        calls: Vec<String>,
         fail_on: Option<&'static str>,
     }
 
@@ -737,8 +962,8 @@ mod tests {
             }
         }
 
-        fn maybe_fail(&mut self, name: &'static str) -> Result<()> {
-            self.calls.push(name);
+        fn maybe_fail(&mut self, name: &str) -> Result<()> {
+            self.calls.push(name.to_string());
             if self.fail_on == Some(name) {
                 return Err(crate::error::BaanError::Write {
                     detail: "simulated failure".to_string(),
@@ -771,6 +996,16 @@ mod tests {
         fn position_at_tag(&mut self, _pos: usize, _len: usize) -> Result<()> {
             self.maybe_fail("position_at_tag")
         }
+        fn send_backspace(&mut self, n: usize) -> Result<()> {
+            self.calls.push(format!("send_backspace({n})"));
+            if self.fail_on == Some("send_backspace") {
+                return Err(crate::error::BaanError::Write {
+                    detail: "simulated failure".to_string(),
+                    source: std::io::Error::other("boom"),
+                });
+            }
+            Ok(())
+        }
     }
 
     fn test_settings() -> Settings {
@@ -792,12 +1027,15 @@ mod tests {
 
         handle_set_clipboard(
             "result\n\n".to_string(),
+            TargetKind::Gui,
+            9,
             &mut clipboard,
             &mut injector,
             &settings,
         );
 
         assert_eq!(clipboard.history.as_slice(), ["result"]);
+        // GUI target ignores trigger_len — no backspace is sent.
         assert_eq!(injector.calls.as_slice(), ["send_ctrl_v"]);
     }
 
@@ -812,6 +1050,8 @@ mod tests {
 
         handle_set_clipboard(
             "result".to_string(),
+            TargetKind::Gui,
+            9,
             &mut clipboard,
             &mut injector,
             &settings,
@@ -831,8 +1071,14 @@ mod tests {
         let mut injector = FakeKeyInjector::default();
         let settings = test_settings();
 
-        let used_clipboard =
-            inject_replacement("hello world", &mut clipboard, &mut injector, &settings).unwrap();
+        let used_clipboard = inject_replacement(
+            "hello world",
+            TargetKind::Gui,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        )
+        .unwrap();
 
         assert!(!used_clipboard);
         assert_eq!(injector.calls.as_slice(), ["send_string"]);
@@ -848,8 +1094,14 @@ mod tests {
         let mut injector = FakeKeyInjector::default();
         let settings = test_settings();
 
-        let used_clipboard =
-            inject_replacement("héllo", &mut clipboard, &mut injector, &settings).unwrap();
+        let used_clipboard = inject_replacement(
+            "héllo",
+            TargetKind::Gui,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        )
+        .unwrap();
 
         assert!(used_clipboard);
         assert_eq!(clipboard.history.as_slice(), ["héllo"]);
@@ -862,7 +1114,13 @@ mod tests {
         let mut injector = FakeKeyInjector::failing_at("send_string");
         let settings = test_settings();
 
-        let result = inject_replacement("plain text", &mut clipboard, &mut injector, &settings);
+        let result = inject_replacement(
+            "plain text",
+            TargetKind::Gui,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        );
         assert!(result.is_err());
     }
 
@@ -883,6 +1141,7 @@ mod tests {
         handle_replace_tag(
             "{{tag}}".to_string(),
             "REPLACED".to_string(),
+            TargetKind::Gui,
             &mut clipboard,
             &mut injector,
             &settings,
@@ -908,6 +1167,7 @@ mod tests {
         handle_replace_tag(
             "{{missing}}".to_string(),
             "REPLACED".to_string(),
+            TargetKind::Gui,
             &mut clipboard,
             &mut injector,
             &settings,
@@ -927,6 +1187,7 @@ mod tests {
         handle_replace_tag(
             "{{tag}}".to_string(),
             "REPLACED".to_string(),
+            TargetKind::Gui,
             &mut clipboard,
             &mut injector,
             &settings,
@@ -968,6 +1229,9 @@ mod tests {
                 assert_eq!(len, "{{tag}}".chars().count());
                 self.0.borrow_mut().position_at_tag(pos, len)
             }
+            fn send_backspace(&mut self, n: usize) -> Result<()> {
+                self.0.borrow_mut().send_backspace(n)
+            }
         }
 
         let settings = test_settings();
@@ -975,9 +1239,257 @@ mod tests {
         handle_replace_tag(
             "{{tag}}".to_string(),
             "x".to_string(),
+            TargetKind::Gui,
             &mut clipboard,
             &mut rec,
             &settings,
         );
+    }
+
+    // ---- infer_target_from_tag_name --------------------------------------
+
+    #[test]
+    fn uppercase_tag_name_targets_terminal() {
+        assert_eq!(infer_target_from_tag_name("HI"), TargetKind::Terminal);
+        assert_eq!(infer_target_from_tag_name("BASE64"), TargetKind::Terminal);
+        assert_eq!(infer_target_from_tag_name("MY-TAG"), TargetKind::Terminal);
+        assert_eq!(infer_target_from_tag_name("HI_2"), TargetKind::Terminal);
+    }
+
+    #[test]
+    fn any_lowercase_letter_targets_gui() {
+        assert_eq!(infer_target_from_tag_name("hi"), TargetKind::Gui);
+        assert_eq!(infer_target_from_tag_name("base64"), TargetKind::Gui);
+        assert_eq!(infer_target_from_tag_name("my-tag"), TargetKind::Gui);
+        // Mixed case counts as GUI too — only *no* lowercase means terminal.
+        assert_eq!(infer_target_from_tag_name("Hello"), TargetKind::Gui);
+        assert_eq!(infer_target_from_tag_name("HIi"), TargetKind::Gui);
+    }
+
+    // ---- infer_clipboard_target -------------------------------------------
+
+    #[test]
+    fn ctrl_shift_c_always_targets_terminal() {
+        // The Ctrl+Shift+C gesture is the terminal copy shortcut regardless of
+        // what (or whether) a tag is on the clipboard.
+        assert_eq!(
+            infer_clipboard_target(true, "name:?arg"),
+            TargetKind::Terminal
+        );
+        assert_eq!(
+            infer_clipboard_target(true, "NAME:?arg"),
+            TargetKind::Terminal
+        );
+        assert_eq!(
+            infer_clipboard_target(true, "no tag here"),
+            TargetKind::Terminal
+        );
+    }
+
+    #[test]
+    fn uppercase_name_targets_terminal_without_shift() {
+        // Plain Ctrl+C with an all-caps tag name also implies terminal.
+        assert_eq!(
+            infer_clipboard_target(false, "NAME:?arg"),
+            TargetKind::Terminal
+        );
+        assert_eq!(
+            infer_clipboard_target(false, "BASE64:?x"),
+            TargetKind::Terminal
+        );
+    }
+
+    #[test]
+    fn lowercase_name_targets_gui_without_shift() {
+        assert_eq!(infer_clipboard_target(false, "name:?arg"), TargetKind::Gui);
+        assert_eq!(infer_clipboard_target(false, "nAmE:?arg"), TargetKind::Gui);
+        // No tag at all → nothing to target; defaults to GUI.
+        assert_eq!(
+            infer_clipboard_target(false, "random text"),
+            TargetKind::Gui
+        );
+    }
+
+    // ---- lookup_trigger ---------------------------------------------------
+
+    #[test]
+    fn lookup_trigger_matches_case_insensitively() {
+        let commands = triggers(&[("greet", &["echo", "{}"])]);
+        let expected = vec!["echo".to_string(), "{}".to_string()];
+        assert_eq!(lookup_trigger(&commands, "greet").unwrap(), &expected);
+        assert_eq!(lookup_trigger(&commands, "GREET").unwrap(), &expected);
+        assert_eq!(lookup_trigger(&commands, "GrEeT").unwrap(), &expected);
+        assert!(lookup_trigger(&commands, "nope").is_none());
+    }
+
+    #[test]
+    fn resolve_clipboard_command_matches_uppercase_tag() {
+        let commands = triggers(&[("greet", &["echo", "{}"])]);
+        let result = resolve_clipboard_command(&commands, "GREET:?world").unwrap();
+        assert_eq!(result, vec!["echo", "world"]);
+    }
+
+    // ---- handle_set_clipboard: terminal target -----------------------------
+
+    #[test]
+    fn handle_set_clipboard_terminal_backspaces_trigger_then_pastes() {
+        let mut clipboard = FakeClipboard::default();
+        let mut injector = FakeKeyInjector::default();
+        let settings = test_settings();
+
+        // "name:?arg" is 9 characters of trigger text left on the line.
+        handle_set_clipboard(
+            "result".to_string(),
+            TargetKind::Terminal,
+            9,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        );
+
+        assert_eq!(clipboard.history.as_slice(), ["result"]);
+        // Trigger text deleted first, then pasted with the terminal shortcut.
+        assert_eq!(
+            injector.calls.as_slice(),
+            ["send_backspace(9)", "send_ctrl_shift_v"]
+        );
+    }
+
+    #[test]
+    fn handle_set_clipboard_terminal_backspace_failure_still_pastes() {
+        let mut clipboard = FakeClipboard::default();
+        let mut injector = FakeKeyInjector::failing_at("send_backspace");
+        let settings = test_settings();
+
+        handle_set_clipboard(
+            "result".to_string(),
+            TargetKind::Terminal,
+            9,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        );
+
+        // Backspace failure is logged but doesn't block the paste — the
+        // output is on the clipboard either way.
+        assert_eq!(clipboard.history.as_slice(), ["result"]);
+        assert_eq!(
+            injector.calls.as_slice(),
+            ["send_backspace(9)", "send_ctrl_shift_v"]
+        );
+    }
+
+    // ---- inject_replacement: terminal target --------------------------------
+
+    #[test]
+    fn inject_replacement_ascii_terminal_types_directly() {
+        let mut clipboard = FakeClipboard::default();
+        let mut injector = FakeKeyInjector::default();
+        let settings = test_settings();
+
+        let used = inject_replacement(
+            "hi",
+            TargetKind::Terminal,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        )
+        .unwrap();
+
+        assert!(!used);
+        assert_eq!(injector.calls.as_slice(), ["send_string"]);
+        assert!(clipboard.history.is_empty());
+    }
+
+    #[test]
+    fn inject_replacement_non_ascii_terminal_pastes_with_ctrl_shift_v() {
+        let mut clipboard = FakeClipboard::default();
+        let mut injector = FakeKeyInjector::default();
+        let settings = test_settings();
+
+        let used = inject_replacement(
+            "héllo",
+            TargetKind::Terminal,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        )
+        .unwrap();
+
+        assert!(used);
+        assert_eq!(clipboard.history.as_slice(), ["héllo"]);
+        assert_eq!(injector.calls.as_slice(), ["send_ctrl_shift_v"]);
+    }
+
+    // ---- handle_replace_tag: terminal target --------------------------------
+
+    #[test]
+    fn handle_replace_tag_terminal_ascii_backspaces_then_types() {
+        let mut clipboard = FakeClipboard::default();
+        let mut injector = FakeKeyInjector::default();
+        let settings = test_settings();
+
+        handle_replace_tag(
+            "<HI/>".to_string(),
+            "Hello World!".to_string(),
+            TargetKind::Terminal,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        );
+
+        // No Home/End, no select/copy: the 5-char tag is deleted with plain
+        // backspaces and the ASCII output is typed directly.
+        assert_eq!(
+            injector.calls.as_slice(),
+            ["send_backspace(5)", "send_string"]
+        );
+        assert!(
+            clipboard.history.is_empty(),
+            "ASCII terminal path must not touch the clipboard"
+        );
+    }
+
+    #[test]
+    fn handle_replace_tag_terminal_non_ascii_pastes_and_restores_clipboard() {
+        let mut clipboard = FakeClipboard::with_text("old clipboard");
+        let mut injector = FakeKeyInjector::default();
+        let settings = test_settings();
+
+        handle_replace_tag(
+            "<HI/>".to_string(),
+            "héllo".to_string(),
+            TargetKind::Terminal,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        );
+
+        assert_eq!(
+            injector.calls.as_slice(),
+            ["send_backspace(5)", "send_ctrl_shift_v"]
+        );
+        // Replacement written, then the old value restored.
+        assert_eq!(clipboard.history.as_slice(), ["héllo", "old clipboard"]);
+    }
+
+    #[test]
+    fn handle_replace_tag_terminal_aborts_if_backspace_fails() {
+        let mut clipboard = FakeClipboard::with_text("prefix <HI/> suffix");
+        let mut injector = FakeKeyInjector::failing_at("send_backspace");
+        let settings = test_settings();
+
+        handle_replace_tag(
+            "<HI/>".to_string(),
+            "out".to_string(),
+            TargetKind::Terminal,
+            &mut clipboard,
+            &mut injector,
+            &settings,
+        );
+
+        // Stops after the failed deletion; never types or touches the clipboard.
+        assert_eq!(injector.calls.as_slice(), ["send_backspace(5)"]);
+        assert!(clipboard.history.is_empty());
     }
 }

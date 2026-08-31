@@ -1,7 +1,7 @@
 # baan
 
 Keyboard input expansion for Linux.
-Type a tag (or copy name:?arg and press Ctrl+C), run a command, then inject the output into GUI applications (excluding terminal emulators).
+Type a tag (or copy name:?arg and press Ctrl+C), run a command, then inject the output into the focused app — GUI apps and terminals alike (terminal injection uses the shortcuts below).
 
 ```text
 <hi/>                →  Hello World!
@@ -24,6 +24,26 @@ baan recognises tags in two shapes:
 
 In every case `{}` in the trigger command is replaced by the tag body (typed
 tag) or the text after `:?` (clipboard tag). Trigger names must be unique.
+
+### Terminal support
+
+Terminals use different shortcuts than GUI apps: copy is **Ctrl+Shift+C**
+(plain Ctrl+C sends SIGINT), paste is **Ctrl+Shift+V**, and Home/End-based
+line selection isn't available. baan infers the injection target from what
+you type — no window detection needed:
+
+| You type / do | Target | How it's injected |
+|---|---|---|
+| `<hi/>` | GUI app | select line, Ctrl+C copy, type / Ctrl+V paste (existing) |
+| `<HI/>` (all-caps name) | Terminal | delete tag with backspaces, type / Ctrl+Shift+V paste |
+| copy `name:?arg`, press **Ctrl+C** | GUI app | result on clipboard, then Ctrl+V |
+| copy `NAME:?arg`, press **Ctrl+C** | Terminal | result on clipboard, then Ctrl+Shift+V |
+| copy `name:?arg`, press **Ctrl+Shift+C** | Terminal | result on clipboard, then Ctrl+Shift+V |
+
+Trigger names are matched case-insensitively, so `<HI/>` and `<hi/>` resolve
+to the same trigger; defining two triggers that differ only by letter case is
+a config error. Only the tag *name* matters for casing — the body keeps its
+case (`<HI>Ada</HI>`).
 
 Needs root (or equivalent) for `/dev/input` and `/dev/uinput`. Works on Wayland and X11.
 

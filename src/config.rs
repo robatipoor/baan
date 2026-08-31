@@ -153,10 +153,10 @@ fn parse_trigger(key: String, value: toml::Value, map: &mut TriggerCommands) -> 
         other => vec![value_to_arg(&key, other)?],
     };
 
-    if map.contains_key(&key) {
+    if let Some(existing) = map.keys().find(|k| k.eq_ignore_ascii_case(&key)) {
         return Err(BaanError::ParseConfigFile {
             line: 0,
-            detail: format!("Duplicate trigger '{}'", key),
+            detail: format!("Trigger '{}' conflicts with '{}'", key, existing),
         });
     }
 
@@ -353,6 +353,39 @@ mod tests {
             }
             _ => panic!("Expected ParseConfigFile error"),
         }
+    }
+
+    #[test]
+    fn exact_duplicate_trigger_rejected() {
+        // Same name defined once at the root level and once in [triggers].
+        let content = "hi = [\"echo\", \"a\"]\n[triggers]\nhi = [\"echo\", \"b\"]\n";
+        let err = parse_config_file(content).unwrap_err();
+        match err {
+            BaanError::ParseConfigFile { detail, .. } => {
+                assert!(detail.contains("conflicts with"), "got {detail}");
+            }
+            _ => panic!("Expected ParseConfigFile error"),
+        }
+    }
+
+    #[test]
+    fn trigger_names_differing_only_by_case_rejected() {
+        let content = "hi = [\"echo\", \"a\"]\nHI = [\"echo\", \"b\"]\n";
+        let err = parse_config_file(content).unwrap_err();
+        match err {
+            BaanError::ParseConfigFile { detail, .. } => {
+                assert!(detail.contains("conflicts with"), "got {detail}");
+            }
+            _ => panic!("Expected ParseConfigFile error"),
+        }
+    }
+
+    #[test]
+    fn trigger_names_same_letters_same_case_still_ok() {
+        // Ordinary lowercase trigger names parse fine.
+        let content = "hi = [\"echo\", \"a\"]\nhello = [\"echo\", \"b\"]\n";
+        let (_, map) = parse_config_file(content).unwrap();
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

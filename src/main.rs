@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use config::{Settings, TriggerCommands, default_config_path};
 use device::{KeyboardDevice, VirtualDevice};
-use engine::process_keyboard_events;
+use engine::run_keyboard_event_loop;
 use error::{BaanError, Result};
 
 use crate::{config::load_config, singal::install_signal_handlers};
@@ -98,7 +98,7 @@ fn run(
         error!("Failed to initialize clipboard");
         BaanError::Clipboard
     })?;
-    process_keyboard_events(clipboard, keyboard, virtual_dev, trigger_commands, settings)
+    run_keyboard_event_loop(clipboard, keyboard, virtual_dev, trigger_commands, settings)
 }
 
 #[cfg(test)]

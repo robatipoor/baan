@@ -37,10 +37,11 @@ pub trait KeyInjector {
     /// Simulate Ctrl+V (paste).
     fn send_ctrl_v(&mut self) -> Result<()>;
     /// Simulate Ctrl+Shift+V (the paste shortcut in terminals).
-    #[allow(dead_code)]
     fn send_ctrl_shift_v(&mut self) -> Result<()>;
     fn send_string(&mut self, s: &str) -> Result<()>;
     fn position_at_tag(&mut self, pos: usize, len: usize) -> Result<()>;
+    /// Press Backspace `n` times, deleting `n` characters before the cursor.
+    fn send_backspace(&mut self, n: usize) -> Result<()>;
 }
 
 /// A virtual keyboard device backed by uinput.
@@ -416,6 +417,9 @@ impl KeyInjector for VirtualDevice {
     }
     fn position_at_tag(&mut self, pos: usize, len: usize) -> Result<()> {
         VirtualDevice::position_at_tag(self, pos, len)
+    }
+    fn send_backspace(&mut self, n: usize) -> Result<()> {
+        VirtualDevice::send_backspace(self, n)
     }
 }
 
